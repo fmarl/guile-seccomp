@@ -176,8 +176,7 @@ EFAULT if it has them, with EINVAL otherwise."
                          operator)))
 
 (define* (seccomp-argument index operator value #:key mask (width 64))
-  "Compare argument INDEX of a system call with VALUE.  Give 32-bit
-arguments, such as int, a WIDTH of 32."
+  "Compare argument INDEX of a system call with VALUE."
   (validate-argument operator mask width)
   (if (= width 32)
       (make-seccomp-argument index 'masked= (logand value %u32)
@@ -309,7 +308,7 @@ RULES.  Calls that no rule matches get DEFAULT.  Return 'fully-enforced,
 
 (define (seccomp-exec rules command . options)
   "Restrict the process to RULES and execute COMMAND, a list of the program
-and its arguments.  Never run COMMAND unrestricted."
+and its arguments."
   (when (eq? 'not-enforced (apply seccomp-restrict! rules options))
     (raise-seccomp-error "seccomp isn't enforced" command))
   (apply execl (first command) command))
