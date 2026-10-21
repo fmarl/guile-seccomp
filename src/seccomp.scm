@@ -31,8 +31,12 @@
 
             seccomp-argument
             seccomp-argument?
+
             seccomp-rule
             seccomp-rule?
+            seccomp-rule-syscall
+            seccomp-rule-action
+            seccomp-rule-arguments
 
             seccomp-restrict!
             seccomp-exec
@@ -52,9 +56,21 @@
                    (make-exception-with-message message)
                    (make-exception-with-irritants irritants))))
 
+(define (validate-list items valid? message)
+  (unless (list? items)
+    (raise-seccomp-error "not a list" items))
+  (let ((invalid (remove valid? items)))
+    (when (pair? invalid)
+      (apply raise-seccomp-error message invalid))))
+
+(define (duplicates items)
+  (delete-duplicates
+   (filter (lambda (item)
+             (< 1 (count (cut equal? item <>) items)))
+           items)))
+
 (define %pr-set-seccomp 22)
 (define %seccomp-mode-filter 2)
-(define %nr-scmp-error -1)
 
 (define prctl
   (foreign-library-function #f "prctl"
@@ -76,10 +92,11 @@
 (define (checked-libseccomp-function name arg-types)
   (let ((proc (libseccomp-function name int arg-types)))
     (lambda args
-      (let ((result (apply proc args)))
-        (when (< result 0)
-          (throw 'system-error name "~A" (list (strerror (- result)))
-                 (list (- result))))
+      (let* ((result (apply proc args))
+             (errno (- result)))
+        (when (positive? errno)
+          (raise-seccomp-error (string-append name ": " (strerror errno))
+                               errno))
         result))))
 
 (define api-get
@@ -122,8 +139,9 @@ EFAULT if it has them, with EINVAL otherwise."
        (kernel-filters?)))
 
 (define (syscall-number name)
+  ;; libseccomp gives negative numbers to calls of other architectures.
   (let ((number (resolve-name (string->pointer (symbol->string name)))))
-    (and (not (= number %nr-scmp-error)) number)))
+    (and (>= number 0) number)))
 
 (define %actions
   '((allow . #x7fff0000)
@@ -152,7 +170,15 @@ EFAULT if it has them, with EINVAL otherwise."
 (define %operators
   '((!= . 1) (< . 2) (<= . 3) (= . 4) (>= . 5) (> . 6) (masked= . 7)))
 
-(define %u32 #xffffffff)
+(define %argument-count 6)
+(define %arg-cmp-size 24)
+
+(define (all-ones width)
+  (1- (ash 1 width)))
+
+(define (fits? value width)
+  (and (exact-integer? value)
+       (<= (- (ash 1 (1- width))) value (all-ones width))))
 
 (define-record-type <seccomp-argument>
   (make-seccomp-argument index operator value mask)
@@ -162,43 +188,62 @@ EFAULT if it has them, with EINVAL otherwise."
   (value    seccomp-argument-value)
   (mask     seccomp-argument-mask))
 
-(define (validate-argument operator mask width)
+(define (validate-mask value mask width)
+  (unless mask
+    (raise-seccomp-error "masked= needs a mask" value))
+  (unless (fits? mask width)
+    (raise-seccomp-error "mask doesn't fit the width" mask width))
+  (unless (zero? (logand value (lognot mask) (all-ones width)))
+    (raise-seccomp-error "value has bits outside the mask" value mask)))
+
+(define (validate-argument index operator value mask width)
+  (unless (and (exact-integer? index) (< -1 index %argument-count))
+    (raise-seccomp-error "argument index out of range" index))
   (unless (assq operator %operators)
     (raise-seccomp-error "unknown operator" operator))
   (unless (memv width '(32 64))
     (raise-seccomp-error "width is neither 32 nor 64" width))
-  (when (and (eq? operator 'masked=) (not (exact-integer? mask)))
-    (raise-seccomp-error "masked= needs a mask" mask))
-  (when (and mask (not (eq? operator 'masked=)))
-    (raise-seccomp-error "only masked= takes a mask" operator mask))
+  (unless (fits? value width)
+    (raise-seccomp-error "value doesn't fit the width" value width))
+  (if (eq? operator 'masked=)
+      (validate-mask value mask width)
+      (when mask
+        (raise-seccomp-error "only masked= takes a mask" operator mask)))
   (when (and (= width 32) (not (memq operator '(= masked=))))
     (raise-seccomp-error "only = and masked= compare 32-bit arguments"
                          operator)))
 
 (define* (seccomp-argument index operator value #:key mask (width 64))
-  "Compare argument INDEX of a system call with VALUE."
-  (validate-argument operator mask width)
-  (if (= width 32)
-      (make-seccomp-argument index 'masked= (logand value %u32)
-                             (logand (or mask %u32) %u32))
-      (make-seccomp-argument index operator value mask)))
+  "Compare argument INDEX of a system call with VALUE.  A WIDTH of 32
+compares only its lower half."
+  (validate-argument index operator value mask width)
+  (let ((mask (if (= width 32) (or mask -1) mask))
+        (unsigned (cut logand <> (all-ones width))))
+    (make-seccomp-argument index (if mask 'masked= operator) (unsigned value)
+                           (and mask (unsigned mask)))))
 
-(define (u64 value)
-  (logand value #xffffffffffffffff))
+(define (argument<? a b)
+  (< (seccomp-argument-index a) (seccomp-argument-index b)))
 
 (define (arguments->bytevector arguments)
-  (let ((bv (make-bytevector (* 24 (length arguments)) 0)))
+  (let ((bv (make-bytevector (* %arg-cmp-size (length arguments)) 0)))
     (for-each
-     (match-lambda*
-       ((($ <seccomp-argument> index operator value mask) offset)
-        (bytevector-u32-native-set! bv offset index)
-        (bytevector-u32-native-set! bv (+ offset 4)
-                                    (assq-ref %operators operator))
-        (bytevector-u64-native-set! bv (+ offset 8) (u64 (or mask value)))
-        (bytevector-u64-native-set! bv (+ offset 16)
-                                    (if mask (u64 value) 0))))
+     (lambda (argument offset)
+       (let* ((value (seccomp-argument-value argument))
+              (mask (seccomp-argument-mask argument))
+              (datum-a datum-b (if mask
+                                   (values mask value)
+                                   (values value 0))))
+         (bytevector-u32-native-set! bv offset
+                                     (seccomp-argument-index argument))
+         (bytevector-u32-native-set! bv (+ offset 4)
+                                     (assq-ref %operators
+                                               (seccomp-argument-operator
+                                                argument)))
+         (bytevector-u64-native-set! bv (+ offset 8) datum-a)
+         (bytevector-u64-native-set! bv (+ offset 16) datum-b)))
      arguments
-     (iota (length arguments) 0 24))
+     (iota (length arguments) 0 %arg-cmp-size))
     bv))
 
 (define-record-type <seccomp-rule>
@@ -213,14 +258,12 @@ EFAULT if it has them, with EINVAL otherwise."
   (unless (symbol? syscall)
     (raise-seccomp-error "system call is not a symbol" syscall))
   (validate-action action)
-  (unless (every seccomp-argument? arguments)
-    (apply raise-seccomp-error "not a seccomp-argument"
-           (remove seccomp-argument? arguments)))
-  (let ((indexes (map seccomp-argument-index arguments)))
-    (unless (= (length indexes) (length (delete-duplicates indexes)))
-      (raise-seccomp-error "argument compared more than once" syscall
-                           indexes)))
-  (make-seccomp-rule syscall action arguments))
+  (validate-list arguments seccomp-argument? "not a seccomp-argument")
+  (let ((indexes (duplicates (map seccomp-argument-index arguments))))
+    (when (pair? indexes)
+      (apply raise-seccomp-error "argument compared more than once" syscall
+             indexes)))
+  (make-seccomp-rule syscall action (sort arguments argument<?)))
 
 (define %attributes
   '((default . 1) (bad-arch . 2) (tsync . 4) (log . 6) (raw-errors . 9)))
@@ -243,45 +286,50 @@ EFAULT if it has them, with EINVAL otherwise."
       %null-pointer
       (bytevector->pointer (arguments->bytevector arguments))))
 
-(define (add-rule! filter rule number)
-  (match rule
-    (($ <seccomp-rule> _ action arguments)
-     (rule-add-array filter (action->value action) number (length arguments)
-                     (arguments->pointer arguments)))))
+(define (add-rule! filter rule)
+  (let ((number (syscall-number (seccomp-rule-syscall rule)))
+        (arguments (seccomp-rule-arguments rule)))
+    (when number
+      (rule-add-array filter (action->value (seccomp-rule-action rule)) number
+                      (length arguments) (arguments->pointer arguments)))))
+
+(define (unknown-syscalls rules)
+  (delete-duplicates
+   (remove syscall-number (map seccomp-rule-syscall rules))))
+
+(define (conflicting-syscalls rules)
+  (let ((condition (lambda (rule)
+                     (cons (seccomp-rule-syscall rule)
+                           (seccomp-rule-arguments rule)))))
+    (delete-duplicates
+     (map car (duplicates (map condition (delete-duplicates rules)))))))
 
 (define (validate-options rules default bad-arch flags)
   (validate-action default)
   (validate-action bad-arch)
-  (let ((unknown-flags (lset-difference eq? flags %flags))
-        (default-rules (filter (compose (cut equal? <> default)
+  (validate-list flags (cut memq <> %flags) "unknown flags")
+  (validate-list rules seccomp-rule? "not a seccomp-rule")
+  (let ((default-rules (filter (compose (cut equal? <> default)
                                         seccomp-rule-action)
-                               rules)))
-    (when (pair? unknown-flags)
-      (raise-seccomp-error "unknown flags" unknown-flags))
+                               rules))
+        (conflicts (conflicting-syscalls rules)))
     (when (pair? default-rules)
-      (raise-seccomp-error "rules take the default action"
-                           (map seccomp-rule-syscall default-rules)))))
+      (apply raise-seccomp-error "rules take the default action"
+             (map seccomp-rule-syscall default-rules)))
+    (when (pair? conflicts)
+      (apply raise-seccomp-error
+             "rules take different actions under the same conditions"
+             conflicts))))
 
-(define (numbered-rules rules)
-  "Return the known rules paired with their system call numbers, and the
-names of the unknown system calls."
-  (let ((known unknown (partition cdr
-                                  (map (lambda (rule)
-                                         (cons rule
-                                               (syscall-number
-                                                (seccomp-rule-syscall rule))))
-                                       rules))))
-    (values known (map (compose seccomp-rule-syscall car) unknown))))
-
-(define (load-filter! numbered default bad-arch flags)
+(define (load-filter! rules default bad-arch flags)
   (call-with-filter default
     (lambda (filter)
-      (false-if-exception (set-attribute! filter 'raw-errors 1))
+      ;; Older versions of libseccomp lack this attribute.
+      (guard (e ((seccomp-error? e) #f))
+        (set-attribute! filter 'raw-errors 1))
       (set-attribute! filter 'bad-arch (action->value bad-arch))
       (for-each (cut set-attribute! filter <> 1) flags)
-      (for-each (match-lambda
-                  ((rule . number) (add-rule! filter rule number)))
-                numbered)
+      (for-each (cut add-rule! filter <>) rules)
       (filter-load filter))))
 
 (define* (seccomp-restrict! rules
@@ -296,10 +344,10 @@ RULES.  Calls that no rule matches get DEFAULT.  Return 'fully-enforced,
   (validate-options rules default bad-arch flags)
   (cond
    ((seccomp-supported?)
-    (let ((numbered unknown (numbered-rules rules)))
+    (let ((unknown (unknown-syscalls rules)))
       (when (and (pair? unknown) (not best-effort?))
-        (raise-seccomp-error "unknown system calls" unknown))
-      (load-filter! numbered default bad-arch flags)
+        (apply raise-seccomp-error "unknown system calls" unknown))
+      (load-filter! rules default bad-arch flags)
       (if (null? unknown) 'fully-enforced 'partially-enforced)))
    (best-effort?
     'not-enforced)
@@ -309,6 +357,11 @@ RULES.  Calls that no rule matches get DEFAULT.  Return 'fully-enforced,
 (define (seccomp-exec rules command . options)
   "Restrict the process to RULES and execute COMMAND, a list of the program
 and its arguments."
-  (when (eq? 'not-enforced (apply seccomp-restrict! rules options))
-    (raise-seccomp-error "seccomp isn't enforced" command))
-  (apply execl (first command) command))
+  (match command
+    (((? string? program) (? string?) ...)
+     (when (eq? 'not-enforced (apply seccomp-restrict! rules options))
+       (raise-seccomp-error "seccomp isn't enforced" command))
+     (apply execl program command))
+    (_
+     (raise-seccomp-error "command is not a non-empty list of strings"
+                          command))))

@@ -26,6 +26,8 @@
              (seccomp))
 
 (define syscall-number (@@ (seccomp) syscall-number))
+(define seccomp-argument-index (@@ (seccomp) seccomp-argument-index))
+(define seccomp-argument-value (@@ (seccomp) seccomp-argument-value))
 
 (define %filtered EDOM)
 (define %clone-newuser #x10000000)
@@ -36,6 +38,7 @@
 (define %personality-query #xffffffff)
 (define %personality-query-bit #x80000000)
 (define %x32-syscall-bit #x40000000)
+(define %pr-set-seccomp 22)
 (define %upper-half (ash 1 32))
 
 (define syscall
@@ -63,15 +66,22 @@
        (if (zero? pid)
            (begin
              (close-port in)
-             (write (false-if-exception (thunk)) out)
+             (write (guard (e (else `(exception ,(object->string e))))
+                      `(value ,(thunk)))
+                    out)
              (close-port out)
              (primitive-exit 0))
            (begin
              (close-port out)
              (let ((result (read in)))
                (close-port in)
-               (waitpid pid)
-               (and (not (eof-object? result)) result))))))))
+               (let ((status (cdr (waitpid pid))))
+                 (match result
+                   (('value value) value)
+                   (('exception description)
+                    (error "child raised an exception" description))
+                   ((? eof-object?)
+                    (error "child died" status)))))))))))
 
 (define (child-status thunk)
   (flush-all-ports)
@@ -114,26 +124,48 @@
           (force-output out)
           (join-thread thread)))))))
 
-(define (exit-code rules thunk . options)
-  (status:exit-val
-   (child-status
-    (lambda ()
-      (apply seccomp-restrict! rules #:best-effort? #f options)
-      (primitive-_exit (thunk))))))
-
-(define (termination-signal rules thunk . options)
-  (status:term-sig
-   (child-status
-    (lambda ()
-      (apply seccomp-restrict! rules #:best-effort? #f options)
-      (thunk)))))
-
-(define (seccomp-error-irritants thunk)
-  (in-child
+(define (restricted-status thunk rules . options)
+  (child-status
    (lambda ()
-     (guard (e ((seccomp-error? e) (exception-irritants e)))
-       (thunk)
-       #f))))
+     (apply seccomp-restrict! rules #:best-effort? #f options)
+     (thunk))))
+
+(define (thread-termination action)
+  (let ((getppid (syscall-number 'getppid)))
+    (restricted-status
+     (lambda ()
+       (match (pipe)
+         ((in . out)
+          (call-with-new-thread
+           (lambda ()
+             (write-char #\x out)
+             (force-output out)
+             (syscall getppid)))
+          (read-char in)
+          (usleep 100000)
+          (primitive-_exit 0))))
+     (list (seccomp-rule 'getppid action)))))
+(define (seccomp-error-field accessor thunk)
+  (guard (e ((seccomp-error? e) (accessor e)))
+    (thunk)
+    'no-error))
+
+(define (error-irritants thunk)
+  (seccomp-error-field exception-irritants thunk))
+
+(define-syntax-rule (test-rejected name proc arguments-list)
+  (let ((all-arguments arguments-list))
+    (test-equal name
+      all-arguments
+      (map (lambda (arguments)
+             (error-irritants (lambda () (apply proc arguments))))
+           all-arguments))))
+
+(define (child-error-irritants thunk)
+  (in-child (cut error-irritants thunk)))
+
+(define (child-error-message thunk)
+  (in-child (cut seccomp-error-field exception-message thunk)))
 
 (define (exec-status command rules)
   (status:exit-val
@@ -144,6 +176,17 @@
         (dup2 null 2))
       (seccomp-exec rules command #:best-effort? #f)))))
 
+(define (hide-seccomp!)
+  (seccomp-restrict! (list (seccomp-rule 'prctl `(errno ,EINVAL)
+                                         (seccomp-argument 0 '= %pr-set-seccomp
+                                                           #:width 32))
+                           (seccomp-rule 'seccomp `(errno ,EINVAL)))
+                     #:best-effort? #f))
+
+(define (deny-filters!)
+  (seccomp-restrict! (list (seccomp-rule 'seccomp `(errno ,EPERM)))
+                     #:best-effort? #f))
+
 (define (program name)
   (search-path (parse-path (getenv "PATH")) name))
 
@@ -152,110 +195,232 @@
 (test-group "validation"
   (test-equal "unknown action"
     '(deny)
-    (seccomp-error-irritants (lambda () (seccomp-rule 'getpid 'deny))))
-  (test-equal "errno above 4095"
-    '((errno 4096))
-    (seccomp-error-irritants (lambda () (seccomp-rule 'getpid '(errno 4096)))))
-  (test-equal "negative errno"
-    '((errno -1))
-    (seccomp-error-irritants (lambda () (seccomp-rule 'getpid '(errno -1)))))
+    (error-irritants (lambda () (seccomp-rule 'getpid 'deny))))
+  (test-rejected "invalid errnos"
+    (cut seccomp-rule 'getpid <>)
+    '(((errno 4096)) ((errno -1)) ((errno foo))))
+  (test-equal "errnos at the bounds"
+    '(#t #t)
+    (map (lambda (errno)
+           (seccomp-rule? (seccomp-rule 'getpid `(errno ,errno))))
+         '(0 4095)))
   (test-equal "system call that isn't a symbol"
     '("getpid")
-    (seccomp-error-irritants
-     (lambda () (seccomp-rule "getpid" 'kill-process))))
+    (error-irritants (lambda () (seccomp-rule "getpid" 'kill-process))))
   (test-equal "argument that isn't a seccomp-argument"
     '((0 = 1))
-    (seccomp-error-irritants
+    (error-irritants
      (lambda () (seccomp-rule 'getpid 'kill-process '(0 = 1)))))
   (test-equal "argument compared twice"
-    '(socket (0 0))
-    (seccomp-error-irritants
+    '(socket 0)
+    (error-irritants
      (lambda ()
        (filtered-rule 'socket
                       (seccomp-argument 0 '>= 3)
+                      (seccomp-argument 1 '= 1)
                       (seccomp-argument 0 '<= 9)))))
+  (test-equal "arguments ordered by index"
+    '(0 2)
+    (map seccomp-argument-index
+         (seccomp-rule-arguments
+          (filtered-rule 'socket
+                         (seccomp-argument 2 '= 0)
+                         (seccomp-argument 0 '= 1)))))
+  (test-rejected "argument index out of range"
+    (cut seccomp-argument <> '= 1)
+    '((-1) (6) (first)))
   (test-equal "unknown operator"
     '(=~)
-    (seccomp-error-irritants (lambda () (seccomp-argument 0 '=~ 1))))
-  (test-equal "masked= without a mask"
-    '(#f)
-    (seccomp-error-irritants (lambda () (seccomp-argument 0 'masked= 1))))
-  (test-equal "mask without masked="
-    '(= 1)
-    (seccomp-error-irritants (lambda () (seccomp-argument 0 '= 1 #:mask 1))))
+    (error-irritants (lambda () (seccomp-argument 0 '=~ 1))))
   (test-equal "unknown width"
     '(16)
-    (seccomp-error-irritants
-     (lambda () (seccomp-argument 0 '= 1 #:width 16))))
-  (test-equal "ordering a 32-bit argument"
-    '(< !=)
-    (map (lambda (operator)
-           (car (seccomp-error-irritants
-                 (lambda () (seccomp-argument 0 operator 1 #:width 32)))))
-         '(< !=)))
+    (error-irritants (lambda () (seccomp-argument 0 '= 1 #:width 16))))
+  (test-rejected "values that don't fit the width"
+    (lambda (value width)
+      (seccomp-argument 0 '= value #:width width))
+    `(("1" 64)
+      (,(ash 1 64) 64)
+      (,(- -1 (ash 1 63)) 64)
+      (,(ash 1 32) 32)
+      (,(- -1 (ash 1 31)) 32)))
+  (test-equal "values at the bounds in two's complement"
+    `(,(1- (ash 1 64)) ,(ash 1 63) ,(1- (ash 1 64)) #xffffffff #x80000000)
+    (map (match-lambda
+           ((value width)
+            (seccomp-argument-value
+             (seccomp-argument 0 '= value #:width width))))
+         `((,(1- (ash 1 64)) 64)
+           (,(- (ash 1 63)) 64)
+           (-1 64)
+           (-1 32)
+           (,(- (ash 1 31)) 32))))
+  (test-equal "masked= without a mask"
+    '(1)
+    (error-irritants (lambda () (seccomp-argument 0 'masked= 1))))
+  (test-rejected "masks that don't fit the width"
+    (lambda (mask width)
+      (seccomp-argument 0 'masked= 0 #:mask mask #:width width))
+    `(("1" 64) (,(ash 1 32) 32)))
+  (test-equal "value with bits outside the mask"
+    '(3 6)
+    (error-irritants (lambda () (seccomp-argument 0 'masked= 3 #:mask 6))))
+  (test-equal "mask without masked="
+    '(= 1)
+    (error-irritants (lambda () (seccomp-argument 0 '= 1 #:mask 1))))
+  (test-rejected "ordering a 32-bit argument"
+    (cut seccomp-argument 0 <> 1 #:width 32)
+    '((!=) (<) (<=) (>=) (>)))
   (test-equal "unknown default action"
     '(deny)
-    (seccomp-error-irritants
+    (child-error-irritants
      (lambda () (seccomp-restrict! '() #:default 'deny))))
   (test-equal "unknown bad-arch action"
     '(deny)
-    (seccomp-error-irritants
+    (child-error-irritants
      (lambda () (seccomp-restrict! '() #:bad-arch 'deny))))
-  (test-equal "unknown flag"
-    '((all-threads))
-    (seccomp-error-irritants
-     (lambda () (seccomp-restrict! '() #:flags '(all-threads)))))
+  (test-equal "invalid flags"
+    '((all-threads) (tsync))
+    (map (lambda (flags)
+           (child-error-irritants
+            (lambda () (seccomp-restrict! '() #:flags flags))))
+         '((tsync all-threads) tsync)))
+  (test-equal "invalid rules"
+    '((getpid) ("getpid"))
+    (map (lambda (rules)
+           (child-error-irritants (lambda () (seccomp-restrict! rules))))
+         `(getpid (,(filtered-rule 'getppid) "getpid"))))
   (test-equal "rule taking the default action"
-    '((getpid))
-    (seccomp-error-irritants
-     (lambda () (seccomp-restrict! (list (seccomp-rule 'getpid 'allow)))))))
+    '(getpid)
+    (child-error-irritants
+     (lambda () (seccomp-restrict! (list (seccomp-rule 'getpid 'allow))))))
+  (test-equal "rules taking different actions under the same conditions"
+    '(socket)
+    (child-error-irritants
+     (lambda ()
+       (seccomp-restrict!
+        (list (filtered-rule 'socket
+                             (seccomp-argument 0 '= 1)
+                             (seccomp-argument 2 '= 0))
+              (filtered-rule 'getpid)
+              (seccomp-rule 'socket 'kill-process
+                            (seccomp-argument 2 '= 0)
+                            (seccomp-argument 0 '= 1))
+              (filtered-rule 'getpid))))))
+  (test-equal "invalid commands"
+    '((()) ((true)) ("true"))
+    (map (lambda (command)
+           (child-error-irritants (lambda () (seccomp-exec '() command))))
+         '(() (true) "true"))))
 
 (unless (seccomp-supported?)
   (format #t "seccomp isn't supported, skipping the kernel tests.~%")
-  (test-skip "unknown system calls")
+  (test-skip "without seccomp")
+  (test-skip "enforcement")
   (test-skip "actions")
   (test-skip "operators")
   (test-skip "filters"))
 
-(test-group "unknown system calls"
-  (test-equal "skipped"
-    'partially-enforced
+(test-group "without seccomp"
+  (test-equal "not supported"
+    #f
     (in-child
      (lambda ()
-       (seccomp-restrict! (list (filtered-rule 'no-such-call))))))
+       (hide-seccomp!)
+       (seccomp-supported?))))
+  (test-equal "not enforced"
+    'not-enforced
+    (in-child
+     (lambda ()
+       (hide-seccomp!)
+       (seccomp-restrict! (list (filtered-rule 'getppid))))))
   (test-equal "rejected in strict mode"
-    '((no-such-call))
-    (seccomp-error-irritants
+    "seccomp isn't supported"
+    (child-error-message
+     (lambda ()
+       (hide-seccomp!)
+       (seccomp-restrict! (list (filtered-rule 'getppid))
+                          #:best-effort? #f))))
+  (test-equal "seccomp-exec refuses to run the program"
+    (list (list (program "true")))
+    (child-error-irritants
+     (lambda ()
+       (hide-seccomp!)
+       (seccomp-exec '() (list (program "true")))))))
+
+(test-group "enforcement"
+  (test-equal "fully"
+    (list 'fully-enforced %filtered)
+    (in-child
+     (lambda ()
+       (list (seccomp-restrict! (list (filtered-rule 'getppid)))
+             (syscall 'getppid)))))
+  (test-equal "partially, skipping unknown system calls"
+    (list 'partially-enforced %filtered)
+    (in-child
+     (lambda ()
+       (list (seccomp-restrict! (list (filtered-rule 'no-such-call)
+                                      (filtered-rule 'getppid)))
+             (syscall 'getppid)))))
+  (test-equal "unknown system calls rejected in strict mode"
+    '(no-such-call)
+    (child-error-irritants
      (lambda ()
        (seccomp-restrict! (list (filtered-rule 'no-such-call))
-                          #:best-effort? #f)))))
+                          #:best-effort? #f))))
+  (when (string-prefix? "x86_64" %host-type)
+    (test-equal "system calls of other architectures are unknown"
+      '(socketcall)
+      (child-error-irritants
+       (lambda ()
+         (seccomp-restrict! (list (filtered-rule 'socketcall))
+                            #:best-effort? #f)))))
+  ;; Without raw errors, libseccomp reports ECANCELED.
+  (test-assert "errors of the kernel"
+    (match (in-child
+            (lambda ()
+              (deny-filters!)
+              (guard (e ((seccomp-error? e)
+                         (cons (exception-message e) (exception-irritants e))))
+                (seccomp-restrict! (list (filtered-rule 'getppid))))))
+      (((? (cut string-prefix? "seccomp_load: " <>)) (? exact-integer? errno))
+       (not (= errno ECANCELED)))
+      (_ #f)))
+  (test-equal "log flag"
+    (list 'fully-enforced %filtered)
+    (in-child
+     (lambda ()
+       (list (seccomp-restrict! (list (filtered-rule 'getppid))
+                                #:flags '(log))
+             (syscall 'getppid))))))
 
 (test-group "actions"
   (test-equal "errno"
     (list %filtered 0)
     (errnos (list (filtered-rule 'getppid))
             '(getppid) '(getpid)))
-  (test-equal "log allows"
-    '(0)
-    (errnos (list (seccomp-rule 'getppid 'log))
-            '(getppid)))
-  (test-equal "allow overrides the default"
-    0
-    (exit-code (list (seccomp-rule 'getppid 'allow)
-                     (seccomp-rule 'exit_group 'allow))
-               (lambda () (syscall 'getppid))
-               #:default `(errno ,%filtered)))
-  (test-equal "the default applies to unmatched system calls"
-    %filtered
-    (exit-code (list (seccomp-rule 'exit_group 'allow))
-               (lambda () (syscall 'getppid))
-               #:default `(errno ,%filtered)))
-  (test-equal "kill-process, kill-thread and trap end the process"
+  (test-equal "the default, overridden by allow and log"
+    (list 0 0 %filtered)
+    (map (lambda (rules)
+           (status:exit-val
+            (restricted-status (lambda () (primitive-_exit (syscall 'getppid)))
+                               (cons (seccomp-rule 'exit_group 'allow) rules)
+                               #:default `(errno ,%filtered))))
+         (list (list (seccomp-rule 'getppid 'allow))
+               (list (seccomp-rule 'getppid 'log))
+               '())))
+  (test-equal "kill-process, kill-thread and trap end a single thread"
     (list SIGSYS SIGSYS SIGSYS)
     (map (lambda (action)
-           (termination-signal (list (seccomp-rule 'getppid action))
-                               (lambda () (syscall 'getppid))))
-         '(kill-process kill-thread trap))))
+           (status:term-sig
+            (restricted-status (lambda () (syscall 'getppid))
+                               (list (seccomp-rule 'getppid action)))))
+         '(kill-process kill-thread trap)))
+  (test-equal "kill-thread spares the other threads"
+    0
+    (status:exit-val (thread-termination 'kill-thread)))
+  (test-equal "kill-process ends all threads"
+    SIGSYS
+    (status:term-sig (thread-termination 'kill-process))))
 
 (test-group "operators"
   (test-equal "=" (list %filtered 0) (umask-errnos '= 10 10 11))
@@ -268,11 +433,16 @@
     (umask-errnos 'masked= 2 3 4 #:mask 6))
   (test-equal "= compares 64 bits" (list %filtered 0)
     (umask-errnos '= %upper-half %upper-half 0))
+  (test-equal "< compares unsigned" (list %filtered 0)
+    (umask-errnos '< 10 9 -1))
+  (test-equal "= with a negative value" (list %filtered 0)
+    (umask-errnos '= -1 -1 #xffffffff))
   (test-equal "= on 32 bits ignores the upper half" (list %filtered 0)
     (umask-errnos '= 10 (logior %upper-half 10) 11 #:width 32))
+  (test-equal "= on 32 bits with a negative value" (list %filtered 0)
+    (umask-errnos '= -1 #xffffffff #xfffffffe #:width 32))
   (test-equal "masked= on 32 bits ignores the upper half" (list %filtered 0)
-    (umask-errnos 'masked= 2 (logior %upper-half 3) 4
-                  #:mask (logior %upper-half 6) #:width 32)))
+    (umask-errnos 'masked= 3 (logior %upper-half 3) 4 #:mask -1 #:width 32)))
 
 (test-group "filters"
   (test-equal "user namespaces"
@@ -308,11 +478,18 @@
                                                  %addr-no-randomize))))
             `(personality ,%addr-no-randomize)
             `(personality ,%personality-query)))
+  (test-equal "rules of one system call with different conditions"
+    (list %filtered ERANGE 0)
+    (errnos (list (filtered-rule 'umask (seccomp-argument 0 '= 1))
+                  (seccomp-rule 'umask `(errno ,ERANGE)
+                                (seccomp-argument 0 '= 2)))
+            '(umask 1) '(umask 2) '(umask 3)))
   (when (string-prefix? "x86_64" %host-type)
     (let ((x32-getppid (logior %x32-syscall-bit (syscall-number 'getppid))))
       (test-equal "bad-arch kills system calls of other architectures"
         SIGSYS
-        (termination-signal '() (lambda () (syscall x32-getppid))))
+        (status:term-sig
+         (restricted-status (lambda () (syscall x32-getppid)) '())))
       (test-equal "bad-arch takes other actions"
         (list %filtered)
         (restricted (lambda () (list (syscall x32-getppid)))
@@ -325,14 +502,8 @@
          '(() (tsync))))
   (test-equal "the executed program is filtered"
     '(0 1)
-    (let ((rules (list (filtered-rule 'unshare
-                                      (seccomp-argument
-                                       0 'masked= %clone-newuser
-                                       #:mask %clone-newuser))
-                       (filtered-rule 'clone3))))
-      (list (exec-status (list (program "true")) rules)
-            (exec-status (list (program "unshare") "--user" (program "true"))
-                         rules)))))
+    (map (cut exec-status (list (program "uname")) <>)
+         (list '() (list (filtered-rule 'uname))))))
 
 (define failures (test-runner-fail-count (test-runner-current)))
 (test-end "seccomp")

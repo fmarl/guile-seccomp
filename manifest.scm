@@ -1,1 +1,1 @@
-(specifications->manifest '("guile" "libseccomp" "make" "coreutils" "util-linux"))
+(specifications->manifest '("guile" "libseccomp" "make" "coreutils"))

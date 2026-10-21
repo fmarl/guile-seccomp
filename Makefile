@@ -1,2 +1,9 @@
+GUILE ?= guile
+
+ifdef GUIX_ENVIRONMENT
+export LD_LIBRARY_PATH := $(GUIX_ENVIRONMENT)/lib$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
+endif
+
+.PHONY: check
 check:
-	LD_LIBRARY_PATH="$$GUIX_ENVIRONMENT/lib" guile -L src tests/seccomp.scm
+	$(GUILE) -L src tests/seccomp.scm

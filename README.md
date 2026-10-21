@@ -1,7 +1,7 @@
 # guile-seccomp
 
 Guile bindings for [seccomp](https://docs.kernel.org/userspace-api/seccomp_filter.html)
-filters through [libseccomp](https://github.com/seccomp/libseccomp). 
+filters through [libseccomp](https://github.com/seccomp/libseccomp).
 
 ```scheme
 (use-modules (seccomp))
@@ -16,8 +16,6 @@ filters through [libseccomp](https://github.com/seccomp/libseccomp).
        (seccomp-rule 'keyctl `(errno ,EPERM)))
  #:flags '(tsync))
 ```
-
-This is very mich WIP and in alpha state. Don't trust it yet.
 
 ## Development
 
