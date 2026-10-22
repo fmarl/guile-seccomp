@@ -318,7 +318,12 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
     (delete-duplicates
      (map car (duplicates (map condition (delete-duplicates rules)))))))
 
-(define (validate-options rules default bad-arch flags)
+(define %enforcement-levels
+  '(not-enforced partially-enforced fully-enforced))
+
+(define (validate-options rules default bad-arch flags require)
+  (unless (memq require %enforcement-levels)
+    (raise-seccomp-error "invalid requirement" require))
   (validate-action default)
   (validate-action bad-arch)
   (validate-list flags (cut memq <> %flags) "unknown flags")
@@ -351,35 +356,39 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
                             (default 'allow)
                             (bad-arch 'kill-process)
                             (flags '())
-                            (best-effort? #f))
+                            (require 'partially-enforced))
   "Filter the system calls of this thread and its future children by
 RULES.  Calls that no rule matches get DEFAULT, and calls of other
-architectures get BAD-ARCH.  Return 'fully-enforced.
+architectures get BAD-ARCH.  With the tsync flag, the other threads are
+filtered too.  Rules of system calls unknown to this architecture are
+skipped.
 
-Raise an error if seccomp isn't supported or a rule names an unknown system
-call.  With BEST-EFFORT?, return 'not-enforced in the first case, and skip
-those rules and return 'partially-enforced in the second."
-  (validate-options rules default bad-arch flags)
-  (cond
-   ((seccomp-supported?)
-    (let ((unknown (unknown-syscalls rules)))
-      (when (and (pair? unknown) (not best-effort?))
-        (apply raise-seccomp-error "unknown system calls" unknown))
-      (load-filter! rules default bad-arch flags)
-      (if (null? unknown) 'fully-enforced 'partially-enforced)))
-   (best-effort?
-    'not-enforced)
-   (else
-    (raise-seccomp-error "seccomp isn't supported"))))
+Return 'fully-enforced, 'partially-enforced if rules were skipped, or
+'not-enforced if seccomp isn't supported.  Raise an error instead if the
+result is below REQUIRE."
+  (validate-options rules default bad-arch flags require)
+  (let* ((supported? (seccomp-supported?))
+         (unknown (if supported? (unknown-syscalls rules) '()))
+         (result (cond ((not supported?) 'not-enforced)
+                       ((null? unknown) 'fully-enforced)
+                       (else 'partially-enforced))))
+    (unless (memq result (member require %enforcement-levels))
+      (if supported?
+          (apply raise-seccomp-error "unknown system calls" unknown)
+          (raise-seccomp-error "seccomp isn't supported")))
+    (when supported?
+      (load-filter! rules default bad-arch flags))
+    result))
 
 (define (seccomp-exec rules command . options)
-  "Restrict the process to RULES and execute COMMAND, a list of the program
-and its arguments, looking the program up in PATH.  OPTIONS are those of
-seccomp-restrict!."
+  "Restrict the process to RULES and replace it with COMMAND, a list of the
+program's file name and its arguments.  OPTIONS are those of
+seccomp-restrict!.  Raise an error instead of running COMMAND unrestricted."
   (match command
     (((? string? program) (? string?) ...)
-     (apply seccomp-restrict! rules options)
-     (apply execlp program command))
+     (when (eq? 'not-enforced (apply seccomp-restrict! rules options))
+       (raise-seccomp-error "seccomp isn't enforced" command))
+     (apply execl program command))
     (_
      (raise-seccomp-error "command is not a non-empty list of strings"
                           command))))

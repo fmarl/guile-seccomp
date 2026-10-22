@@ -174,6 +174,9 @@
         (dup2 null 2))
       (seccomp-exec rules command)))))
 
+(define (program name)
+  (search-path (parse-path (getenv "PATH")) name))
+
 (define (hide-seccomp!)
   (seccomp-restrict! (list (seccomp-rule 'prctl `(errno ,EINVAL)
                                          (seccomp-argument 0 '= %pr-set-seccomp
@@ -277,6 +280,10 @@
            (child-error-irritants
             (lambda () (seccomp-restrict! '() #:flags flags))))
          '((tsync all-threads) tsync)))
+  (test-equal "invalid requirement"
+    '(mostly-enforced)
+    (child-error-irritants
+     (lambda () (seccomp-restrict! '() #:require 'mostly-enforced))))
   (test-equal "invalid rules"
     '((getpid) ("getpid"))
     (map (lambda (rules)
@@ -326,26 +333,24 @@
      (lambda ()
        (hide-seccomp!)
        (seccomp-restrict! (list (filtered-rule 'getppid))))))
-  (test-equal "not enforced with best effort"
+  (test-equal "accepting no enforcement"
     'not-enforced
     (in-child
      (lambda ()
        (hide-seccomp!)
        (seccomp-restrict! (list (filtered-rule 'getppid))
-                          #:best-effort? #t))))
-  (test-equal "seccomp-exec refuses to run the program by default"
-    "seccomp isn't supported"
-    (child-error-message
-     (lambda ()
-       (hide-seccomp!)
-       (seccomp-exec '() '("true")))))
-  (test-equal "seccomp-exec runs the program with best effort"
-    0
-    (status:exit-val
-     (child-status
-      (lambda ()
-        (hide-seccomp!)
-        (seccomp-exec '() '("true") #:best-effort? #t))))))
+                          #:require 'not-enforced))))
+  (test-equal "seccomp-exec refuses to run the program unrestricted"
+    `("seccomp isn't supported" ((,(program "true"))))
+    (list (child-error-message
+           (lambda ()
+             (hide-seccomp!)
+             (seccomp-exec '() (list (program "true")))))
+          (child-error-irritants
+           (lambda ()
+             (hide-seccomp!)
+             (seccomp-exec '() (list (program "true"))
+                           #:require 'not-enforced))))))
 
 (test-group "enforcement"
   (test-equal "fully"
@@ -354,27 +359,28 @@
      (lambda ()
        (list (seccomp-restrict! (list (filtered-rule 'getppid)))
              (syscall 'getppid)))))
-  (test-equal "unknown system calls rejected by default"
-    '(no-such-call)
-    (child-error-irritants
-     (lambda ()
-       (seccomp-restrict! (list (filtered-rule 'no-such-call))))))
-  (test-equal "partially with best effort, skipping unknown system calls"
+  (test-equal "partially, skipping unknown system calls"
     (list 'partially-enforced %filtered)
     (in-child
      (lambda ()
        (list (seccomp-restrict! (list (filtered-rule 'no-such-call)
-                                      (filtered-rule 'getppid))
-                                #:best-effort? #t)
+                                      (filtered-rule 'getppid)))
              (syscall 'getppid)))))
+  (test-equal "fully-enforced requirement rejects unknown system calls"
+    '(no-such-call)
+    (child-error-irritants
+     (lambda ()
+       (seccomp-restrict! (list (filtered-rule 'no-such-call))
+                          #:require 'fully-enforced))))
   (when (string-prefix? "x86_64" %host-type)
     (test-equal "system calls of other architectures are unknown"
       '(socketcall)
       (child-error-irritants
        (lambda ()
-         (seccomp-restrict! (list (filtered-rule 'socketcall)))))))
+         (seccomp-restrict! (list (filtered-rule 'socketcall))
+                            #:require 'fully-enforced)))))
   ;; Without raw errors, libseccomp reports ECANCELED.
-  (test-assert "errors of the kernel"
+  (test-assert "kernel errors"
     (match (in-child
             (lambda ()
               (deny-filters!)
@@ -499,9 +505,9 @@
     (map (lambda (flags)
            (restricted-thread (list (filtered-rule 'getppid)) flags))
          '(() (tsync))))
-  (test-equal "the executed program is searched in PATH and filtered"
+  (test-equal "the executed program is filtered"
     '(0 1)
-    (map (cut exec-status '("uname") <>)
+    (map (cut exec-status (list (program "uname")) <>)
          (list '() (list (filtered-rule 'uname))))))
 
 (define failures (test-runner-fail-count (test-runner-current)))
