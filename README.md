@@ -17,6 +17,11 @@ filters through [libseccomp](https://github.com/seccomp/libseccomp).
  #:flags '(tsync))
 ```
 
+`seccomp-restrict!` raises an error if seccomp isn't supported or a rule
+names an unknown system call.  With `#:best-effort? #t`, it returns
+`not-enforced` in the first case, and skips those rules and returns
+`partially-enforced` in the second.
+
 ## Development
 
 ```sh

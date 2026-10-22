@@ -26,8 +26,6 @@
              (seccomp))
 
 (define syscall-number (@@ (seccomp) syscall-number))
-(define seccomp-argument-index (@@ (seccomp) seccomp-argument-index))
-(define seccomp-argument-value (@@ (seccomp) seccomp-argument-value))
 
 (define %filtered EDOM)
 (define %clone-newuser #x10000000)
@@ -96,7 +94,7 @@
 (define (restricted thunk rules . options)
   (in-child
    (lambda ()
-     (apply seccomp-restrict! rules #:best-effort? #f options)
+     (apply seccomp-restrict! rules options)
      (thunk))))
 
 (define (errnos rules . calls)
@@ -119,7 +117,7 @@
                        (lambda ()
                          (read-char in)
                          (syscall 'getppid)))))
-          (seccomp-restrict! rules #:best-effort? #f #:flags flags)
+          (seccomp-restrict! rules #:flags flags)
           (write-char #\x out)
           (force-output out)
           (join-thread thread)))))))
@@ -127,7 +125,7 @@
 (define (restricted-status thunk rules . options)
   (child-status
    (lambda ()
-     (apply seccomp-restrict! rules #:best-effort? #f options)
+     (apply seccomp-restrict! rules options)
      (thunk))))
 
 (define (thread-termination action)
@@ -174,21 +172,16 @@
       (let ((null (open-fdes "/dev/null" O_WRONLY)))
         (dup2 null 1)
         (dup2 null 2))
-      (seccomp-exec rules command #:best-effort? #f)))))
+      (seccomp-exec rules command)))))
 
 (define (hide-seccomp!)
   (seccomp-restrict! (list (seccomp-rule 'prctl `(errno ,EINVAL)
                                          (seccomp-argument 0 '= %pr-set-seccomp
                                                            #:width 32))
-                           (seccomp-rule 'seccomp `(errno ,EINVAL)))
-                     #:best-effort? #f))
+                           (seccomp-rule 'seccomp `(errno ,EINVAL)))))
 
 (define (deny-filters!)
-  (seccomp-restrict! (list (seccomp-rule 'seccomp `(errno ,EPERM)))
-                     #:best-effort? #f))
-
-(define (program name)
-  (search-path (parse-path (getenv "PATH")) name))
+  (seccomp-restrict! (list (seccomp-rule 'seccomp `(errno ,EPERM)))))
 
 (test-begin "seccomp")
 
@@ -327,25 +320,32 @@
      (lambda ()
        (hide-seccomp!)
        (seccomp-supported?))))
-  (test-equal "not enforced"
-    'not-enforced
-    (in-child
-     (lambda ()
-       (hide-seccomp!)
-       (seccomp-restrict! (list (filtered-rule 'getppid))))))
-  (test-equal "rejected in strict mode"
+  (test-equal "rejected by default"
     "seccomp isn't supported"
     (child-error-message
      (lambda ()
        (hide-seccomp!)
-       (seccomp-restrict! (list (filtered-rule 'getppid))
-                          #:best-effort? #f))))
-  (test-equal "seccomp-exec refuses to run the program"
-    (list (list (program "true")))
-    (child-error-irritants
+       (seccomp-restrict! (list (filtered-rule 'getppid))))))
+  (test-equal "not enforced with best effort"
+    'not-enforced
+    (in-child
      (lambda ()
        (hide-seccomp!)
-       (seccomp-exec '() (list (program "true")))))))
+       (seccomp-restrict! (list (filtered-rule 'getppid))
+                          #:best-effort? #t))))
+  (test-equal "seccomp-exec refuses to run the program by default"
+    "seccomp isn't supported"
+    (child-error-message
+     (lambda ()
+       (hide-seccomp!)
+       (seccomp-exec '() '("true")))))
+  (test-equal "seccomp-exec runs the program with best effort"
+    0
+    (status:exit-val
+     (child-status
+      (lambda ()
+        (hide-seccomp!)
+        (seccomp-exec '() '("true") #:best-effort? #t))))))
 
 (test-group "enforcement"
   (test-equal "fully"
@@ -354,26 +354,25 @@
      (lambda ()
        (list (seccomp-restrict! (list (filtered-rule 'getppid)))
              (syscall 'getppid)))))
-  (test-equal "partially, skipping unknown system calls"
+  (test-equal "unknown system calls rejected by default"
+    '(no-such-call)
+    (child-error-irritants
+     (lambda ()
+       (seccomp-restrict! (list (filtered-rule 'no-such-call))))))
+  (test-equal "partially with best effort, skipping unknown system calls"
     (list 'partially-enforced %filtered)
     (in-child
      (lambda ()
        (list (seccomp-restrict! (list (filtered-rule 'no-such-call)
-                                      (filtered-rule 'getppid)))
+                                      (filtered-rule 'getppid))
+                                #:best-effort? #t)
              (syscall 'getppid)))))
-  (test-equal "unknown system calls rejected in strict mode"
-    '(no-such-call)
-    (child-error-irritants
-     (lambda ()
-       (seccomp-restrict! (list (filtered-rule 'no-such-call))
-                          #:best-effort? #f))))
   (when (string-prefix? "x86_64" %host-type)
     (test-equal "system calls of other architectures are unknown"
       '(socketcall)
       (child-error-irritants
        (lambda ()
-         (seccomp-restrict! (list (filtered-rule 'socketcall))
-                            #:best-effort? #f)))))
+         (seccomp-restrict! (list (filtered-rule 'socketcall)))))))
   ;; Without raw errors, libseccomp reports ECANCELED.
   (test-assert "errors of the kernel"
     (match (in-child
@@ -500,9 +499,9 @@
     (map (lambda (flags)
            (restricted-thread (list (filtered-rule 'getppid)) flags))
          '(() (tsync))))
-  (test-equal "the executed program is filtered"
+  (test-equal "the executed program is searched in PATH and filtered"
     '(0 1)
-    (map (cut exec-status (list (program "uname")) <>)
+    (map (cut exec-status '("uname") <>)
          (list '() (list (filtered-rule 'uname))))))
 
 (define failures (test-runner-fail-count (test-runner-current)))

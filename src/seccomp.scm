@@ -31,6 +31,10 @@
 
             seccomp-argument
             seccomp-argument?
+            seccomp-argument-index
+            seccomp-argument-operator
+            seccomp-argument-value
+            seccomp-argument-mask
 
             seccomp-rule
             seccomp-rule?
@@ -44,6 +48,10 @@
             seccomp-error?))
 
 (define %libseccomp "libseccomp")
+
+;; Without libseccomp's development files, only the versioned library is
+;; installed.
+(define %libseccomp-soname "libseccomp.so.2")
 
 (define-exception-type &seccomp-error &error
   make-seccomp-error
@@ -80,7 +88,11 @@
                             #:return-errno? #t))
 
 (define libseccomp
-  (delay (load-foreign-library %libseccomp)))
+  (delay (catch 'misc-error
+           (lambda ()
+             (load-foreign-library %libseccomp))
+           (lambda _
+             (load-foreign-library %libseccomp-soname)))))
 
 (define (libseccomp-function name return-type arg-types)
   (let ((proc (delay (foreign-library-function (force libseccomp) name
@@ -128,13 +140,14 @@
     (const 0)))
 
 (define (kernel-filters?)
-  "Whether the kernel has seccomp filters.  It rejects a missing filter with
-EFAULT if it has them, with EINVAL otherwise."
+  "Whether the kernel has seccomp filters.  Setting a null filter fails with
+EFAULT if it does, and with EINVAL if it doesn't."
   (call-with-values (cut prctl %pr-set-seccomp %seccomp-mode-filter 0 0 0)
     (lambda (_ errno)
       (= errno EFAULT))))
 
 (define (seccomp-supported?)
+  "Whether libseccomp can be loaded and the kernel has seccomp filters."
   (and (> (seccomp-api-level) 0)
        (kernel-filters?)))
 
@@ -214,8 +227,9 @@ EFAULT if it has them, with EINVAL otherwise."
                          operator)))
 
 (define* (seccomp-argument index operator value #:key mask (width 64))
-  "Compare argument INDEX of a system call with VALUE.  A WIDTH of 32
-compares only its lower half."
+  "Compare argument INDEX of a system call to VALUE with OPERATOR.  masked=
+compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
+32 bits are compared."
   (validate-argument index operator value mask width)
   (let ((mask (if (= width 32) (or mask -1) mask))
         (unsigned (cut logand <> (all-ones width))))
@@ -337,10 +351,14 @@ compares only its lower half."
                             (default 'allow)
                             (bad-arch 'kill-process)
                             (flags '())
-                            (best-effort? #t))
+                            (best-effort? #f))
   "Filter the system calls of this thread and its future children by
-RULES.  Calls that no rule matches get DEFAULT.  Return 'fully-enforced,
-'partially-enforced or 'not-enforced."
+RULES.  Calls that no rule matches get DEFAULT, and calls of other
+architectures get BAD-ARCH.  Return 'fully-enforced.
+
+Raise an error if seccomp isn't supported or a rule names an unknown system
+call.  With BEST-EFFORT?, return 'not-enforced in the first case, and skip
+those rules and return 'partially-enforced in the second."
   (validate-options rules default bad-arch flags)
   (cond
    ((seccomp-supported?)
@@ -356,12 +374,12 @@ RULES.  Calls that no rule matches get DEFAULT.  Return 'fully-enforced,
 
 (define (seccomp-exec rules command . options)
   "Restrict the process to RULES and execute COMMAND, a list of the program
-and its arguments."
+and its arguments, looking the program up in PATH.  OPTIONS are those of
+seccomp-restrict!."
   (match command
     (((? string? program) (? string?) ...)
-     (when (eq? 'not-enforced (apply seccomp-restrict! rules options))
-       (raise-seccomp-error "seccomp isn't enforced" command))
-     (apply execl program command))
+     (apply seccomp-restrict! rules options)
+     (apply execlp program command))
     (_
      (raise-seccomp-error "command is not a non-empty list of strings"
                           command))))
