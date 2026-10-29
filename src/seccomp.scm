@@ -280,7 +280,8 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
   (make-seccomp-rule syscall action (sort arguments argument<?)))
 
 (define %attributes
-  '((default . 1) (bad-arch . 2) (tsync . 4) (log . 6) (raw-errors . 9)))
+  '((default . 1) (bad-arch . 2) (tsync . 4) (log . 6) (optimize . 8)
+    (raw-errors . 9)))
 
 (define %flags '(tsync log))
 
@@ -346,6 +347,8 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
       ;; Older versions of libseccomp lack this attribute.
       (guard (e ((seccomp-error? e) #f))
         (set-attribute! filter 'raw-errors 1))
+      (guard (e ((seccomp-error? e) #f))
+        (set-attribute! filter 'optimize 2))
       (set-attribute! filter 'bad-arch (action->value bad-arch))
       (for-each (cut set-attribute! filter <> 1) flags)
       (for-each (cut add-rule! filter <>) rules)
