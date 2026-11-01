@@ -26,21 +26,10 @@
   #:use-module (srfi srfi-71)
   #:use-module (system foreign)
   #:use-module (system foreign-library)
-  #:export (seccomp-api-level
-            seccomp-supported?
+  #:export (seccomp-supported?
 
             seccomp-argument
-            seccomp-argument?
-            seccomp-argument-index
-            seccomp-argument-operator
-            seccomp-argument-value
-            seccomp-argument-mask
-
             seccomp-rule
-            seccomp-rule?
-            seccomp-rule-syscall
-            seccomp-rule-action
-            seccomp-rule-arguments
 
             seccomp-restrict!
             seccomp-exec
@@ -57,19 +46,19 @@
   make-seccomp-error
   seccomp-error?)
 
-(define (raise-seccomp-error message . irritants)
+(define (raise-seccomp-error who message . irritants)
   (raise-exception
    (make-exception (make-seccomp-error)
-                   (make-exception-with-origin 'seccomp)
+                   (make-exception-with-origin who)
                    (make-exception-with-message message)
                    (make-exception-with-irritants irritants))))
 
-(define (validate-list items valid? message)
+(define (validate-list who items valid? message)
   (unless (list? items)
-    (raise-seccomp-error "not a list" items))
+    (raise-seccomp-error who "not a list" items))
   (let ((invalid (remove valid? items)))
     (when (pair? invalid)
-      (apply raise-seccomp-error message invalid))))
+      (apply raise-seccomp-error who message invalid))))
 
 (define (duplicates items)
   (delete-duplicates
@@ -80,6 +69,7 @@
 (define %pr-set-seccomp 22)
 (define %seccomp-mode-filter 2)
 
+;; prctl is variadic, but fixed integer arguments work on Linux's ABIs.
 (define prctl
   (foreign-library-function #f "prctl"
                             #:return-type int
@@ -102,13 +92,13 @@
       (apply (force proc) args))))
 
 (define (checked-libseccomp-function name arg-types)
-  (let ((proc (libseccomp-function name int arg-types)))
+  (let ((proc (libseccomp-function name int arg-types))
+        (who (string->symbol name)))
     (lambda args
       (let* ((result (apply proc args))
              (errno (- result)))
         (when (positive? errno)
-          (raise-seccomp-error (string-append name ": " (strerror errno))
-                               errno))
+          (raise-seccomp-error who (strerror errno) errno))
         result))))
 
 (define api-get
@@ -163,6 +153,8 @@ EFAULT if it does, and with EINVAL if it doesn't."
     (kill-thread . #x00000000)
     (kill-process . #x80000000)))
 
+(define %errno-action #x00050000)
+
 (define (errno? value)
   (and (exact-integer? value) (<= 0 value 4095)))
 
@@ -171,13 +163,13 @@ EFAULT if it does, and with EINVAL if it doesn't."
     (('errno errno) (errno? errno))
     (_ (and (assq action %actions) #t))))
 
-(define (validate-action action)
+(define (validate-action who action)
   (unless (action? action)
-    (raise-seccomp-error "unknown action" action)))
+    (raise-seccomp-error who "unknown action" action)))
 
 (define (action->value action)
   (match action
-    (('errno errno) (logior #x00050000 errno))
+    (('errno errno) (logior %errno-action errno))
     (_ (assq-ref %actions action))))
 
 (define %operators
@@ -201,30 +193,33 @@ EFAULT if it does, and with EINVAL if it doesn't."
   (value    seccomp-argument-value)
   (mask     seccomp-argument-mask))
 
+(define (raise-argument-error message . irritants)
+  (apply raise-seccomp-error 'seccomp-argument message irritants))
+
 (define (validate-mask value mask width)
   (unless mask
-    (raise-seccomp-error "masked= needs a mask" value))
+    (raise-argument-error "masked= needs a mask" value))
   (unless (fits? mask width)
-    (raise-seccomp-error "mask doesn't fit the width" mask width))
+    (raise-argument-error "mask doesn't fit the width" mask width))
   (unless (zero? (logand value (lognot mask) (all-ones width)))
-    (raise-seccomp-error "value has bits outside the mask" value mask)))
+    (raise-argument-error "value has bits outside the mask" value mask)))
 
 (define (validate-argument index operator value mask width)
   (unless (and (exact-integer? index) (< -1 index %argument-count))
-    (raise-seccomp-error "argument index out of range" index))
+    (raise-argument-error "argument index out of range" index))
   (unless (assq operator %operators)
-    (raise-seccomp-error "unknown operator" operator))
+    (raise-argument-error "unknown operator" operator))
   (unless (memv width '(32 64))
-    (raise-seccomp-error "width is neither 32 nor 64" width))
+    (raise-argument-error "width is neither 32 nor 64" width))
   (unless (fits? value width)
-    (raise-seccomp-error "value doesn't fit the width" value width))
+    (raise-argument-error "value doesn't fit the width" value width))
   (if (eq? operator 'masked=)
       (validate-mask value mask width)
       (when mask
-        (raise-seccomp-error "only masked= takes a mask" operator mask)))
+        (raise-argument-error "only masked= takes a mask" operator mask)))
   (when (and (= width 32) (not (memq operator '(= masked=))))
-    (raise-seccomp-error "only = and masked= compare 32-bit arguments"
-                         operator)))
+    (raise-argument-error "only = and masked= compare 32-bit arguments"
+                          operator)))
 
 (define* (seccomp-argument index operator value #:key mask (width 64))
   "Compare argument INDEX of a system call to VALUE with OPERATOR.  masked=
@@ -270,17 +265,18 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
 (define (seccomp-rule syscall action . arguments)
   "Take ACTION when SYSCALL is called and all ARGUMENTS match."
   (unless (symbol? syscall)
-    (raise-seccomp-error "system call is not a symbol" syscall))
-  (validate-action action)
-  (validate-list arguments seccomp-argument? "not a seccomp-argument")
+    (raise-seccomp-error 'seccomp-rule "system call is not a symbol" syscall))
+  (validate-action 'seccomp-rule action)
+  (validate-list 'seccomp-rule arguments seccomp-argument?
+                 "not a seccomp-argument")
   (let ((indexes (duplicates (map seccomp-argument-index arguments))))
     (when (pair? indexes)
-      (apply raise-seccomp-error "argument compared more than once" syscall
-             indexes)))
+      (apply raise-seccomp-error 'seccomp-rule
+             "argument compared more than once" syscall indexes)))
   (make-seccomp-rule syscall action (sort arguments argument<?)))
 
 (define %attributes
-  '((default . 1) (bad-arch . 2) (tsync . 4) (log . 6) (optimize . 8)
+  '((bad-arch . 2) (no-new-privs . 3) (tsync . 4) (log . 6) (optimize . 8)
     (raw-errors . 9)))
 
 (define %flags '(tsync log))
@@ -291,7 +287,7 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
 (define (call-with-filter default proc)
   (let ((filter (filter-init (action->value default))))
     (when (null-pointer? filter)
-      (raise-seccomp-error "cannot create a filter" default))
+      (raise-seccomp-error 'seccomp_init "cannot create a filter" default))
     (dynamic-wind (const #t)
                   (cut proc filter)
                   (cut filter-release filter))))
@@ -312,44 +308,63 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
   (delete-duplicates
    (remove syscall-number (map seccomp-rule-syscall rules))))
 
-(define (conflicting-syscalls rules)
-  (let ((condition (lambda (rule)
-                     (cons (seccomp-rule-syscall rule)
-                           (seccomp-rule-arguments rule)))))
-    (delete-duplicates
-     (map car (duplicates (map condition (delete-duplicates rules)))))))
+(define (clash? rule other)
+  "Whether RULE and OTHER take different actions on a system call under the
+same conditions, or one shadows the other unconditionally."
+  (let ((arguments (seccomp-rule-arguments rule))
+        (other-arguments (seccomp-rule-arguments other)))
+    (and (eq? (seccomp-rule-syscall rule) (seccomp-rule-syscall other))
+         (not (equal? (seccomp-rule-action rule) (seccomp-rule-action other)))
+         (or (null? arguments)
+             (null? other-arguments)
+             (equal? arguments other-arguments)))))
+
+(define (clashing-syscalls rules)
+  (delete-duplicates
+   (filter-map (lambda (rule)
+                 (and (any (cut clash? rule <>) rules)
+                      (seccomp-rule-syscall rule)))
+               rules)))
 
 (define %enforcement-levels
   '(not-enforced partially-enforced fully-enforced))
 
+(define (enforced-at-least? result require)
+  (and (memq result (memq require %enforcement-levels)) #t))
+
 (define (validate-options rules default bad-arch flags require)
+  (define (raise-options-error message . irritants)
+    (apply raise-seccomp-error 'seccomp-restrict! message irritants))
+
   (unless (memq require %enforcement-levels)
-    (raise-seccomp-error "invalid requirement" require))
-  (validate-action default)
-  (validate-action bad-arch)
-  (validate-list flags (cut memq <> %flags) "unknown flags")
-  (validate-list rules seccomp-rule? "not a seccomp-rule")
+    (raise-options-error "invalid requirement" require))
+  (validate-action 'seccomp-restrict! default)
+  (validate-action 'seccomp-restrict! bad-arch)
+  (validate-list 'seccomp-restrict! flags (cut memq <> %flags)
+                 "unknown flags")
+  (validate-list 'seccomp-restrict! rules seccomp-rule? "not a seccomp-rule")
   (let ((default-rules (filter (compose (cut equal? <> default)
                                         seccomp-rule-action)
                                rules))
-        (conflicts (conflicting-syscalls rules)))
+        (clashes (clashing-syscalls rules)))
     (when (pair? default-rules)
-      (apply raise-seccomp-error "rules take the default action"
+      (apply raise-options-error "rules take the default action"
              (map seccomp-rule-syscall default-rules)))
-    (when (pair? conflicts)
-      (apply raise-seccomp-error
-             "rules take different actions under the same conditions"
-             conflicts))))
+    (when (pair? clashes)
+      (apply raise-options-error "rules of a system call take clashing actions"
+             clashes))))
 
 (define (load-filter! rules default bad-arch flags)
   (call-with-filter default
     (lambda (filter)
-      ;; Older versions of libseccomp lack this attribute.
+      ;; Older versions of libseccomp lack these attributes.
       (guard (e ((seccomp-error? e) #f))
         (set-attribute! filter 'raw-errors 1))
       (guard (e ((seccomp-error? e) #f))
         (set-attribute! filter 'optimize 2))
       (set-attribute! filter 'bad-arch (action->value bad-arch))
+      ;; This is libseccomp's default, but the docstring promises it.
+      (set-attribute! filter 'no-new-privs 1)
       (for-each (cut set-attribute! filter <> 1) flags)
       (for-each (cut add-rule! filter <>) rules)
       (filter-load filter))))
@@ -359,39 +374,44 @@ compares the argument ANDed with MASK.  With a WIDTH of 32, only the lower
                             (default 'allow)
                             (bad-arch 'kill-process)
                             (flags '())
-                            (require 'partially-enforced))
-  "Filter the system calls of this thread and its future children by
-RULES.  Calls that no rule matches get DEFAULT, and calls of other
-architectures get BAD-ARCH.  With the tsync flag, the other threads are
-filtered too.  Rules of system calls unknown to this architecture are
-skipped.
+                            (require 'fully-enforced))
+  "Filter the system calls of this thread and its future children by RULES
+for good, and set no_new_privs.  Calls that no rule matches get DEFAULT, and
+calls of other architectures get BAD-ARCH.  With the tsync flag, the other
+threads are filtered too.  Rules of unknown system calls are skipped.
 
 Return 'fully-enforced, 'partially-enforced if rules were skipped, or
-'not-enforced if seccomp isn't supported.  Raise an error instead if the
-result is below REQUIRE."
+'not-enforced if seccomp isn't supported, and raise an error instead if that
+is below REQUIRE."
   (validate-options rules default bad-arch flags require)
   (let* ((supported? (seccomp-supported?))
          (unknown (if supported? (unknown-syscalls rules) '()))
          (result (cond ((not supported?) 'not-enforced)
                        ((null? unknown) 'fully-enforced)
                        (else 'partially-enforced))))
-    (unless (memq result (member require %enforcement-levels))
+    (unless (enforced-at-least? result require)
       (if supported?
-          (apply raise-seccomp-error "unknown system calls" unknown)
-          (raise-seccomp-error "seccomp isn't supported")))
+          (apply raise-seccomp-error 'seccomp-restrict!
+                 "unknown system calls" unknown)
+          (raise-seccomp-error 'seccomp-restrict! "seccomp isn't supported")))
     (when supported?
       (load-filter! rules default bad-arch flags))
     result))
 
 (define (seccomp-exec rules command . options)
-  "Restrict the process to RULES and replace it with COMMAND, a list of the
-program's file name and its arguments.  OPTIONS are those of
-seccomp-restrict!.  Raise an error instead of running COMMAND unrestricted."
+  "Restrict the process to RULES with the OPTIONS of seccomp-restrict!, and
+replace it with COMMAND, a list of a file name and arguments.  Raise an
+error instead of running COMMAND unrestricted.  If executing it fails, the
+process stays restricted."
   (match command
     (((? string? program) (? string?) ...)
+     (unless (access? program X_OK)
+       (raise-seccomp-error 'seccomp-exec "program is not executable"
+                            program))
      (when (eq? 'not-enforced (apply seccomp-restrict! rules options))
-       (raise-seccomp-error "seccomp isn't enforced" command))
+       (raise-seccomp-error 'seccomp-exec "seccomp isn't enforced" command))
      (apply execl program command))
     (_
-     (raise-seccomp-error "command is not a non-empty list of strings"
+     (raise-seccomp-error 'seccomp-exec
+                          "command is not a non-empty list of strings"
                           command))))

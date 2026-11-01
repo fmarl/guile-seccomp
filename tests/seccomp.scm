@@ -37,6 +37,7 @@
 (define %personality-query-bit #x80000000)
 (define %x32-syscall-bit #x40000000)
 (define %pr-set-seccomp 22)
+(define %pr-get-no-new-privs 39)
 (define %upper-half (ash 1 32))
 
 (define syscall
@@ -128,6 +129,21 @@
      (apply seccomp-restrict! rules options)
      (thunk))))
 
+(define gettid
+  (foreign-library-function #f "gettid" #:return-type int))
+
+(define no-new-privs
+  (let ((prctl (foreign-library-function #f "prctl"
+                                         #:return-type int
+                                         #:arg-types (list int unsigned-long
+                                                           unsigned-long
+                                                           unsigned-long
+                                                           unsigned-long))))
+    (lambda ()
+      (prctl %pr-get-no-new-privs 0 0 0 0))))
+
+;; Exit with 0 once a thread is gone that calls getppid, which takes ACTION,
+;; or with 1 if the thread survives the call.
 (define (thread-termination action)
   (let ((getppid (syscall-number 'getppid)))
     (restricted-status
@@ -136,13 +152,19 @@
          ((in . out)
           (call-with-new-thread
            (lambda ()
-             (write-char #\x out)
+             (write (gettid) out)
+             (newline out)
              (force-output out)
-             (syscall getppid)))
-          (read-char in)
-          (usleep 100000)
+             (syscall getppid)
+             (primitive-_exit 1)))
+          (let ((task (format #f "/proc/self/task/~a" (read in))))
+            (let wait ()
+              (when (file-exists? task)
+                (usleep 1000)
+                (wait))))
           (primitive-_exit 0))))
      (list (seccomp-rule 'getppid action)))))
+
 (define (seccomp-error-field accessor thunk)
   (guard (e ((seccomp-error? e) (accessor e)))
     (thunk)
@@ -196,9 +218,9 @@
     (cut seccomp-rule 'getpid <>)
     '(((errno 4096)) ((errno -1)) ((errno foo))))
   (test-equal "errnos at the bounds"
-    '(#t #t)
+    '(no-error no-error)
     (map (lambda (errno)
-           (seccomp-rule? (seccomp-rule 'getpid `(errno ,errno))))
+           (error-irritants (cut seccomp-rule 'getpid `(errno ,errno))))
          '(0 4095)))
   (test-equal "system call that isn't a symbol"
     '("getpid")
@@ -215,13 +237,6 @@
                       (seccomp-argument 0 '>= 3)
                       (seccomp-argument 1 '= 1)
                       (seccomp-argument 0 '<= 9)))))
-  (test-equal "arguments ordered by index"
-    '(0 2)
-    (map seccomp-argument-index
-         (seccomp-rule-arguments
-          (filtered-rule 'socket
-                         (seccomp-argument 2 '= 0)
-                         (seccomp-argument 0 '= 1)))))
   (test-rejected "argument index out of range"
     (cut seccomp-argument <> '= 1)
     '((-1) (6) (first)))
@@ -239,16 +254,15 @@
       (,(- -1 (ash 1 63)) 64)
       (,(ash 1 32) 32)
       (,(- -1 (ash 1 31)) 32)))
-  (test-equal "values at the bounds in two's complement"
-    `(,(1- (ash 1 64)) ,(ash 1 63) ,(1- (ash 1 64)) #xffffffff #x80000000)
+  (test-equal "values at the bounds"
+    (make-list 4 'no-error)
     (map (match-lambda
            ((value width)
-            (seccomp-argument-value
-             (seccomp-argument 0 '= value #:width width))))
+            (error-irritants
+             (cut seccomp-argument 0 '= value #:width width))))
          `((,(1- (ash 1 64)) 64)
            (,(- (ash 1 63)) 64)
-           (-1 64)
-           (-1 32)
+           (#xffffffff 32)
            (,(- (ash 1 31)) 32))))
   (test-equal "masked= without a mask"
     '(1)
@@ -306,13 +320,30 @@
                             (seccomp-argument 2 '= 0)
                             (seccomp-argument 0 '= 1))
               (filtered-rule 'getpid))))))
+  (test-equal "unconditional rule shadowing rules of other actions"
+    '(socket)
+    (child-error-irritants
+     (lambda ()
+       (seccomp-restrict!
+        (list (seccomp-rule 'socket 'kill-process (seccomp-argument 0 '= 1))
+              (filtered-rule 'getpid)
+              (filtered-rule 'socket)
+              (filtered-rule 'getpid (seccomp-argument 0 '= 1)))))))
   (test-equal "invalid commands"
     '((()) ((true)) ("true"))
     (map (lambda (command)
            (child-error-irritants (lambda () (seccomp-exec '() command))))
-         '(() (true) "true"))))
+         '(() (true) "true")))
+  (test-equal "program that isn't executable"
+    '("/nonexistent")
+    (child-error-irritants
+     (lambda () (seccomp-exec '() '("/nonexistent"))))))
 
 (unless (seccomp-supported?)
+  (when (getenv "SECCOMP_TESTS_REQUIRED")
+    (format (current-error-port)
+            "seccomp isn't supported, but the kernel tests are required.~%")
+    (exit #f))
   (format #t "seccomp isn't supported, skipping the kernel tests.~%")
   (test-skip "without seccomp")
   (test-skip "enforcement")
@@ -364,7 +395,8 @@
     (in-child
      (lambda ()
        (list (seccomp-restrict! (list (filtered-rule 'no-such-call)
-                                      (filtered-rule 'getppid)))
+                                      (filtered-rule 'getppid))
+                                #:require 'partially-enforced)
              (syscall 'getppid)))))
   (test-equal "fully-enforced requirement rejects unknown system calls"
     '(no-such-call)
@@ -385,9 +417,9 @@
             (lambda ()
               (deny-filters!)
               (guard (e ((seccomp-error? e)
-                         (cons (exception-message e) (exception-irritants e))))
+                         (cons (exception-origin e) (exception-irritants e))))
                 (seccomp-restrict! (list (filtered-rule 'getppid))))))
-      (((? (cut string-prefix? "seccomp_load: " <>)) (? exact-integer? errno))
+      (('seccomp_load (? exact-integer? errno))
        (not (= errno ECANCELED)))
       (_ #f)))
   (test-equal "log flag"
@@ -396,7 +428,14 @@
      (lambda ()
        (list (seccomp-restrict! (list (filtered-rule 'getppid))
                                 #:flags '(log))
-             (syscall 'getppid))))))
+             (syscall 'getppid)))))
+  (test-equal "no_new_privs"
+    '(0 1)
+    (in-child
+     (lambda ()
+       (let ((before (no-new-privs)))
+         (seccomp-restrict! (list (filtered-rule 'getppid)))
+         (list before (no-new-privs)))))))
 
 (test-group "actions"
   (test-equal "errno"
